@@ -1,0 +1,349 @@
+#!/usr/bin/env node
+"use strict";
+
+const { spawn } = require("node:child_process");
+
+const QUERY_TIMEOUT_MS = 15_000;
+const READ_TIMEOUT_MS = 30_000;
+const MAX_QUERY_BYTES = 1024 * 1024;
+const MAX_PHOTO_BYTES = 64 * 1024 * 1024;
+
+function log(message) {
+  process.stderr.write(`[debug] ${message}\n`);
+}
+
+function usage() {
+  process.stderr.write("usage: update.debug\n");
+}
+
+function failUsage(message) {
+  process.stderr.write(`[error] ${message}\n`);
+  usage();
+  process.exit(2);
+}
+
+function parseArgs(argv) {
+  for (let index = 0; index < argv.length; ) {
+    const arg = argv[index];
+
+    switch (arg) {
+      case "-h":
+      case "--help":
+        usage();
+        process.exit(0);
+        break;
+      default:
+        failUsage(`unknown option: ${arg}`);
+    }
+  }
+}
+
+function printable(buffer, maxBytes = 900) {
+  const text = buffer.toString("utf8", 0, Math.min(buffer.length, maxBytes));
+  return text.replace(/[\r\n\t]+/g, " ").replace(/[^\x20-\x7e]+/g, "?");
+}
+
+function runCommand(command, args, options) {
+  return new Promise((resolve, reject) => {
+    log(`exec: ${command} ${args.map((arg) => JSON.stringify(arg)).join(" ")}`);
+    const child = spawn(command, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const stdout = [];
+    const stderr = [];
+    let total = 0;
+    let settled = false;
+    let timedOut = false;
+
+    function rejectOnce(error) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, options.timeoutMs);
+
+    child.stdout.on("data", (chunk) => {
+      total += chunk.length;
+      if (total > options.maxBytes) {
+        child.kill("SIGTERM");
+        rejectOnce(new Error(`command output exceeded ${options.maxBytes} bytes`));
+        return;
+      }
+      stdout.push(chunk);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr.push(chunk);
+    });
+
+    child.on("error", rejectOnce);
+
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (settled) {
+        return;
+      }
+
+      const output = Buffer.concat(stdout, total);
+      const errorOutput = Buffer.concat(stderr);
+      log(`exit: code=${code} signal=${signal || ""} stdout=${output.length} stderr=${errorOutput.length}`);
+
+      if (errorOutput.length > 0) {
+        log(`stderr: ${printable(errorOutput)}`);
+      }
+      if (options.showStdout && output.length > 0) {
+        log(`stdout: ${printable(output)}`);
+      }
+
+      if (timedOut) {
+        rejectOnce(new Error("command timed out"));
+        return;
+      }
+      if (code !== 0 || signal) {
+        rejectOnce(new Error(`command failed: code=${code} signal=${signal || ""}`));
+        return;
+      }
+
+      settled = true;
+      resolve(output);
+    });
+  });
+}
+
+function fieldValue(row, name) {
+  const match = row.match(new RegExp(`(?:^|[\\s,])${name}=([^,\\r\\n]+)`));
+  return match ? match[1].trim() : "";
+}
+
+function parseRows(queryOutput) {
+  return queryOutput
+    .toString("utf8")
+    .split(/\r?\n/)
+    .filter((line) => /^Row:\s+\d+\s+/.test(line));
+}
+
+function isImageRow(row) {
+  const mimeType = fieldValue(row, "mime_type").toLowerCase();
+  const mediaType = fieldValue(row, "media_type");
+
+  return (
+    mimeType.startsWith("image/") ||
+    mediaType === "1" ||
+    (!mimeType && !mediaType)
+  );
+}
+
+function addUniqueUri(uris, uri) {
+  if (!uris.includes(uri)) {
+    uris.push(uri);
+  }
+}
+
+function candidateUrisFromRows(queryOutput, baseUri) {
+  const rows = parseRows(queryOutput);
+  const uris = [];
+
+  log(`rows from ${baseUri}: ${rows.length}`);
+  for (const row of rows.slice(0, 20)) {
+    log(`row: ${printable(Buffer.from(row), 500)}`);
+    const id = fieldValue(row, "_id");
+    if (!/^\d+$/.test(id)) {
+      continue;
+    }
+
+    if (baseUri.endsWith("/file")) {
+      if (isImageRow(row)) {
+        addUniqueUri(uris, `${baseUri}/${id}`);
+        addUniqueUri(uris, `content://media/external/images/media/${id}`);
+        addUniqueUri(uris, `content://media/external_primary/images/media/${id}`);
+      }
+      continue;
+    }
+
+    addUniqueUri(uris, `${baseUri}/${id}`);
+  }
+
+  return uris;
+}
+
+async function queryPhotoCandidates() {
+  const attempts = [
+    {
+      uri: "content://media/external/images/media",
+      projection: "_id:mime_type",
+      sort: "date_added DESC",
+    },
+    {
+      uri: "content://media/external/images/media",
+      projection: "_id:mime_type",
+    },
+    {
+      uri: "content://media/external_primary/images/media",
+      projection: "_id:mime_type",
+      sort: "date_added DESC",
+    },
+    {
+      uri: "content://media/external_primary/images/media",
+      projection: "_id:mime_type",
+    },
+    {
+      uri: "content://media/external/file",
+      projection: "_id:mime_type:media_type",
+      sort: "date_added DESC",
+    },
+    {
+      uri: "content://media/external/file",
+      projection: "_id:mime_type:media_type",
+    },
+    {
+      uri: "content://media/external_primary/file",
+      projection: "_id:mime_type:media_type",
+      sort: "date_added DESC",
+    },
+    {
+      uri: "content://media/external_primary/file",
+      projection: "_id:mime_type:media_type",
+    },
+  ];
+  const candidates = [];
+
+  for (const attempt of attempts) {
+    const args = [
+      "query",
+      "--uri",
+      attempt.uri,
+      "--projection",
+      attempt.projection,
+    ];
+
+    if (attempt.sort) {
+      args.push("--sort", attempt.sort);
+    }
+
+    try {
+      const queryOutput = await runCommand("content", args, {
+        timeoutMs: QUERY_TIMEOUT_MS,
+        maxBytes: MAX_QUERY_BYTES,
+        showStdout: true,
+      });
+      for (const uri of candidateUrisFromRows(queryOutput, attempt.uri)) {
+        addUniqueUri(candidates, uri);
+      }
+    } catch (error) {
+      log(`query failed for ${attempt.uri}: ${error.message}`);
+    }
+  }
+
+  log(`candidate count: ${candidates.length}`);
+  for (const uri of candidates) {
+    log(`candidate: ${uri}`);
+  }
+
+  return candidates;
+}
+
+async function readPhotoByContent(uri) {
+  return runCommand("content", ["read", "--uri", uri], {
+    timeoutMs: READ_TIMEOUT_MS,
+    maxBytes: MAX_PHOTO_BYTES,
+    showStdout: false,
+  });
+}
+
+async function readFirstPhoto() {
+  const candidates = await queryPhotoCandidates();
+
+  for (const uri of candidates) {
+    try {
+      log(`trying read: ${uri}`);
+      const photo = await readPhotoByContent(uri);
+      const contentType = detectContentType(photo);
+      log(`read ok: bytes=${photo.length} contentType=${contentType}`);
+
+      if (photo.length > 0 && contentType.startsWith("image/")) {
+        return photo;
+      }
+    } catch (error) {
+      log(`read failed: ${uri}: ${error.message}`);
+    }
+  }
+
+  throw new Error("photo not found");
+}
+
+function detectContentType(buffer) {
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return "image/jpeg";
+  }
+
+  if (
+    buffer.length >= 12 &&
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  if (
+    buffer.length >= 12 &&
+    buffer.toString("ascii", 4, 8) === "ftyp" &&
+    ["heic", "heix", "hevc", "hevx", "mif1", "msf1"].includes(buffer.toString("ascii", 8, 12))
+  ) {
+    return "image/heic";
+  }
+
+  if (
+    buffer.length >= 6 &&
+    (buffer.toString("ascii", 0, 6) === "GIF87a" ||
+      buffer.toString("ascii", 0, 6) === "GIF89a")
+  ) {
+    return "image/gif";
+  }
+
+  return "application/octet-stream";
+}
+
+function logRuntimeContext() {
+  log(`argv=${JSON.stringify(process.argv)}`);
+  log(`cwd=${process.cwd()}`);
+  log(`uid=${typeof process.getuid === "function" ? process.getuid() : "n/a"} gid=${typeof process.getgid === "function" ? process.getgid() : "n/a"}`);
+  for (const name of ["PATH", "ANDROID_DATA", "ANDROID_ROOT", "EXTERNAL_STORAGE", "TMPDIR", "CLASSPATH"]) {
+    log(`env ${name}=${process.env[name] || ""}`);
+  }
+}
+
+async function main() {
+  parseArgs(process.argv.slice(2));
+  logRuntimeContext();
+
+  const photo = await readFirstPhoto();
+  log(`content read success: bytes=${photo.length} contentType=${detectContentType(photo)}`);
+
+  process.stdout.write("update success\n");
+}
+
+main().catch((error) => {
+  process.stderr.write(`[error] ${error.stack || error.message}\n`);
+  process.exit(1);
+});
